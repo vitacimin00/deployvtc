@@ -67,8 +67,25 @@ const BACKUP_HOUR = parseInt(process.env.BACKUP_HOUR || '3', 10); // Default jam
 //    begitu proses hidup lagi — bukan menunggu besok.
 let lastBackupDate = null;
 
+// Container yang SUDAH sukses ter-upload hari ini (WIB). Dipakai supaya kalau
+// sebagian upload gagal, tick berikutnya hanya mengulang yang gagal — bukan
+// meng-upload ulang semua container dari awal.
+let backupState = { date: null, done: new Set() };
+
 const wibDate = (d = new Date()) => d.toLocaleDateString('sv-SE', { timeZone: 'Asia/Jakarta' });
-const wibHour = (d = new Date()) => parseInt(d.toLocaleString('en-US', { timeZone: 'Asia/Jakarta', hour: 'numeric', hour12: false }));
+
+// hourCycle 'h23' -> jam 00:00 WIB dikembalikan sebagai 0, BUKAN 24.
+// Versi lama memakai hour12:false (locale en-US) yang menghasilkan "24" di tengah
+// malam, sehingga `hour < BACKUP_HOUR` lolos dan backup jalan sebelum jam target.
+// Modulo 24 sebagai pengaman kalau locale runtime tetap mengembalikan 24.
+const wibHour = (d = new Date()) => {
+    const h = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Jakarta',
+        hour: '2-digit',
+        hourCycle: 'h23'
+    }).format(d);
+    return parseInt(h, 10) % 24;
+};
 
 /**
  * Start auto backup cron — cek tiap 10 menit.
@@ -93,9 +110,14 @@ const checkAndRunBackup = async () => {
 
     // Jam target sudah lewat & hari ini belum backup → jalan sekarang (catch-up)
     const result = await runAutoBackup();
-    // Hanya tandai selesai kalau backup benar-benar dieksekusi. Kalau rclone
-    // belum terpasang / tidak ada container, biarkan dicoba lagi nanti.
-    if (result && result.ran) lastBackupDate = today;
+    // Tandai "hari ini selesai" HANYA kalau benar-benar dieksekusi DAN nol gagal.
+    // Kalau sebagian gagal, tick 10 menit berikutnya mengulang yang gagal saja
+    // (lihat backupState) — bukan menyerah sampai besok seperti versi sebelumnya.
+    if (result && result.ran && result.failed === 0) {
+        lastBackupDate = today;
+    } else if (result && result.ran && result.failed > 0) {
+        console.log(`[BACKUP] ${result.failed} bot gagal — dicoba lagi tiap 10 menit (hari ini belum ditandai selesai).`);
+    }
 };
 
 /**
@@ -147,9 +169,10 @@ const uploadWithVerify = (localFile, remoteFile, expectedSize) => {
 };
 
 /**
- * Run auto backup for all running deployments.
- * Return { ran: boolean, success, failed } — ran=false artinya tidak jadi
+ * Run auto backup for running deployments yang belum sukses hari ini.
+ * Return { ran, success, failed, remaining } — ran=false artinya tidak jadi
  * dieksekusi (rclone belum ada / tidak ada container) supaya bisa dicoba lagi.
+ * failed > 0 TIDAK menandai hari ini selesai: tick berikutnya mengulang yang gagal.
  */
 const runAutoBackup = async () => {
     // Check if rclone is installed
@@ -173,12 +196,22 @@ const runAutoBackup = async () => {
     const today = wibDate();
     const remotePath = `${RCLONE_REMOTE}:Bot-Backups/${VPS_IP}/${today}`;
 
-    console.log(`[BACKUP] Mulai auto backup ${deployments.length} bot → ${remotePath}`);
+    // Hari (WIB) berganti -> reset daftar container yang sudah sukses.
+    if (backupState.date !== today) backupState = { date: today, done: new Set() };
+
+    // Hanya proses yang belum sukses hari ini → retry sebagian, bukan ulang semua.
+    const pending = deployments.filter(d => !backupState.done.has(d.container_name));
+    if (pending.length === 0) {
+        console.log('[BACKUP] Semua container sudah ter-backup hari ini, dilewati.');
+        return { ran: true, success: 0, failed: 0, alreadyDone: true };
+    }
+
+    console.log(`[BACKUP] Mulai auto backup ${pending.length}/${deployments.length} bot → ${remotePath}`);
 
     let success = 0, failed = 0;
     const results = [];
 
-    for (const dep of deployments) {
+    for (const dep of pending) {
         const label = dep.store_name || dep.container_name;
         let backupFile = null;
         try {
@@ -196,6 +229,7 @@ const runAutoBackup = async () => {
 
             if (up.ok) {
                 success++;
+                backupState.done.add(dep.container_name);
                 const retryNote = up.attempts > 1 ? ` (percobaan ke-${up.attempts})` : '';
                 results.push(`✅ ${label}${retryNote}`);
             } else {
@@ -211,20 +245,23 @@ const runAutoBackup = async () => {
         }
     }
 
-    console.log(`[BACKUP] Selesai: ${success} sukses, ${failed} gagal`);
+    console.log(`[BACKUP] Selesai: ${success} sukses, ${failed} gagal (total ${deployments.length} bot)`);
 
-    // Write to system logs (persistent)
+    // Write to system logs (persistent).
+    // `verified` DIHITUNG dari hasil sebenarnya (setiap file memang diverifikasi
+    // lewat rclone lsjson + cek ukuran), bukan konstanta true seperti sebelumnya.
     db.addSystemLog('backup', `Auto backup selesai: ${success} ✅ ${failed} ❌`, {
         date: today,
         remote_path: remotePath,
         total: deployments.length,
+        attempted: pending.length,
         success,
         failed,
-        verified: true,
+        verified: failed === 0,
         details: results
     });
 
-    return { ran: true, success, failed };
+    return { ran: true, success, failed, remaining: pending.length - success };
 };
 
 module.exports = { startExpiryCron, checkExpiredDeployments, startAutoBackupCron, runAutoBackup };
